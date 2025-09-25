@@ -1,142 +1,213 @@
+// src/routes/videos.js
 import { Router } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
+import { Readable } from 'stream';
 import { nanoid } from 'nanoid';
 import { requireAuth } from '../middleware/auth.js';
-import { readDB, writeDB } from '../utils/fsdb.js';
 import { transcodeVideo, generateSampleVideo } from '../services/ffmpeg.js';
+import { putObjectStream, getObjectStream } from '../services/storage_s3.js';
+import {
+  putFileRec,
+  listFilesByOwner,
+  getFileRec,
+  putJobRec,
+  listJobsByOwner,
+  getJobRec,
+  updateJobStatus
+} from '../services/metadata_dynamo.js';
 
 const router = Router();
 
-const uploadDir = path.join(process.cwd(), 'uploads');
-const outputDir = path.join(process.cwd(), 'outputs');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: uploadDir,
-  filename: (req, file, cb) => {
-    const id = nanoid(10);
-    const ext = path.extname(file.originalname) || '.bin';
-    cb(null, `${id}${ext}`);
-  }
-});
-const upload = multer({ storage });
-
-// Upload a video (unstructured data)
-router.post('/upload', requireAuth, upload.single('file'), (req, res) => {
-  const db = readDB();
-  const fileRec = {
-    id: path.parse(req.file.filename).name,
-    owner: req.user.sub,
-    originalName: req.file.originalname,
-    path: req.file.path,
-    size: req.file.size,
-    createdAt: new Date().toISOString()
-  };
-  db.files.push(fileRec);
-  writeDB(db);
-  res.json({ ok: true, file: fileRec });
+// Multer in-memory storage so we can stream to S3 (no local disk)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 1024 * 1024 * 1024 } // 1 GB
 });
 
-// Generate a sample video server-side (to avoid client upload bottleneck)
-router.post('/generate-sample', requireAuth, async (req, res) => {
-  const id = nanoid(10);
-  const outPath = path.join(uploadDir, `${id}.mp4`);
+// Upload a video -> stream to S3, record metadata in DynamoDB
+router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
   try {
-    await generateSampleVideo(outPath, 60);
-    const db = readDB();
+    if (!req.file) return res.status(400).json({ error: 'missing file' });
+    const id = nanoid(10);
+    const ext = path.extname(req.file.originalname) || '.bin';
+    const key = `uploads/${id}${ext}`;
+
+    await putObjectStream(key, req.file.mimetype || 'application/octet-stream', readableFromBuffer(req.file.buffer));
+
     const fileRec = {
-      id,
+      fileId: id,
       owner: req.user.sub,
-      originalName: 'sample_generated.mp4',
-      path: outPath,
-      size: fs.statSync(outPath).size,
+      s3Key: key,
+      originalName: req.file.originalname,
+      size: req.file.size,
       createdAt: new Date().toISOString()
     };
-    db.files.push(fileRec);
-    writeDB(db);
+    await putFileRec(fileRec);
+
     res.json({ ok: true, file: fileRec });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// Create a transcode job (structured metadata + CPU task)
+// Generate a sample video -> upload to S3, record metadata in DynamoDB
+router.post('/generate-sample', requireAuth, async (req, res) => {
+  try {
+    const id = nanoid(10);
+    const tmpPath = path.join(os.tmpdir(), `${id}.mp4`);
+    await generateSampleVideo(tmpPath, 60);
+
+    const key = `uploads/${id}.mp4`;
+    const buf = fs.readFileSync(tmpPath);
+    await putObjectStream(key, 'video/mp4', readableFromBuffer(buf));
+    safeUnlink(tmpPath);
+
+    const fileRec = {
+      fileId: id,
+      owner: req.user.sub,
+      s3Key: key,
+      originalName: 'sample_generated.mp4',
+      size: buf.length,
+      createdAt: new Date().toISOString()
+    };
+    await putFileRec(fileRec);
+
+    res.json({ ok: true, file: fileRec });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// Create a transcode job: S3 -> /tmp -> ffmpeg -> S3 (async)
 router.post('/transcode', requireAuth, async (req, res) => {
-  const { fileId, preset='720p' } = req.body || {};
-  const db = readDB();
-  const fileRec = db.files.find(f => f.id === fileId);
-  if (!fileRec) return res.status(404).json({ error: 'file not found' });
+  try {
+    const { fileId, preset = '720p' } = req.body || {};
+    const fileRec = await getFileRec(fileId);
+    if (!fileRec || fileRec.owner !== req.user.sub) {
+      return res.status(404).json({ error: 'file not found' });
+    }
 
-  const jobId = nanoid(12);
-  const outPath = path.join(outputDir, `${jobId}.mp4`);
-  const job = {
-    id: jobId,
-    owner: req.user.sub,
-    fileId,
-    preset,
-    status: 'running',
-    output: outPath,
-    createdAt: new Date().toISOString(),
-    finishedAt: null,
-    error: null
-  };
-  db.jobs.push(job);
-  writeDB(db);
+    const jobId = nanoid(12);
+    const outKey = `outputs/${jobId}.mp4`;
+    const createdAt = new Date().toISOString();
 
-  // Fire-and-forget CPU-intensive task
-  transcodeVideo(fileRec.path, outPath, preset)
-    .then(() => {
-      const db2 = readDB();
-      const j = db2.jobs.find(j => j.id === jobId);
-      if (j) {
-        j.status = 'finished';
-        j.finishedAt = new Date().toISOString();
-        writeDB(db2);
+    const job = {
+      jobId,
+      owner: req.user.sub,
+      fileId,
+      preset,
+      status: 'running',
+      s3Key: outKey,
+      createdAt,
+      finishedAt: null,
+      error: null
+    };
+    await putJobRec(job);
+
+    // Fire-and-forget worker
+    (async () => {
+      const inTmp = path.join(os.tmpdir(), `${fileId}-${jobId}-in`);
+      const outTmp = path.join(os.tmpdir(), `${jobId}.mp4`);
+      try {
+        // Download input from S3 to /tmp
+        const { stream: inStream } = await getObjectStream(fileRec.s3Key);
+        await streamToFile(inStream, inTmp);
+
+        // Transcode with ffmpeg
+        await transcodeVideo(inTmp, outTmp, preset);
+
+        // Upload output to S3
+        const outBuf = fs.readFileSync(outTmp);
+        await putObjectStream(outKey, 'video/mp4', readableFromBuffer(outBuf));
+
+        // Cleanup
+        safeUnlink(inTmp);
+        safeUnlink(outTmp);
+
+        await updateJobStatus(jobId, { status: 'finished', finishedAt: new Date().toISOString() });
+      } catch (err) {
+        safeUnlink(inTmp);
+        safeUnlink(outTmp);
+        await updateJobStatus(jobId, { status: 'error', error: String(err.message || err) });
       }
-    })
-    .catch(err => {
-      const db2 = readDB();
-      const j = db2.jobs.find(j => j.id === jobId);
-      if (j) {
-        j.status = 'error';
-        j.error = err.message;
-        writeDB(db2);
-      }
-    });
+    })();
 
-  res.status(202).json({ ok: true, job });
+    res.status(202).json({ ok: true, job });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
-router.get('/jobs', requireAuth, (req, res) => {
-  const db = readDB();
-  const mine = db.jobs.filter(j => j.owner === req.user.sub).sort((a,b)=> (b.createdAt||'').localeCompare(a.createdAt||''));
-  res.json({ ok: true, jobs: mine });
+// List my files (DynamoDB)
+router.get('/files', requireAuth, async (req, res) => {
+  try {
+    const files = await listFilesByOwner(req.user.sub);
+    res.json({ ok: true, files });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
-router.get('/job/:id', requireAuth, (req, res) => {
-  const db = readDB();
-  const job = db.jobs.find(j => j.id === req.params.id && j.owner === req.user.sub);
-  if (!job) return res.status(404).json({ error: 'job not found' });
-  res.json({ ok: true, job });
+// List my jobs (DynamoDB)
+router.get('/jobs', requireAuth, async (req, res) => {
+  try {
+    const jobs = await listJobsByOwner(req.user.sub);
+    res.json({ ok: true, jobs });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
-// Serve finished outputs (authorization: owner only)
-router.get('/download/:jobId', requireAuth, (req, res) => {
-  const db = readDB();
-  const job = db.jobs.find(j => j.id === req.params.jobId && j.owner === req.user.sub);
-  if (!job) return res.status(404).json({ error: 'job not found' });
-  if (job.status !== 'finished') return res.status(409).json({ error: 'job not finished' });
-  res.download(job.output, path.basename(job.output));
+// Job detail
+router.get('/job/:id', requireAuth, async (req, res) => {
+  try {
+    const job = await getJobRec(req.params.id);
+    if (!job || job.owner !== req.user.sub) return res.status(404).json({ error: 'job not found' });
+    res.json({ ok: true, job });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
-// List my files
-router.get('/files', requireAuth, (req, res) => {
-  const db = readDB();
-  const mine = db.files.filter(f => f.owner === req.user.sub).sort((a,b)=> (b.createdAt||'').localeCompare(a.createdAt||''));
-  res.json({ ok: true, files: mine });
+// Download finished output -> stream from S3
+router.get('/download/:jobId', requireAuth, async (req, res) => {
+  try {
+    const job = await getJobRec(req.params.jobId);
+    if (!job || job.owner !== req.user.sub) return res.status(404).json({ error: 'job not found' });
+    if (job.status !== 'finished') return res.status(409).json({ error: 'job not finished' });
+
+    const { stream, contentType } = await getObjectStream(job.s3Key);
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${path.basename(job.s3Key)}"`);
+    stream.pipe(res);
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 export default router;
+
+/** Helpers **/
+function readableFromBuffer(buf) {
+  const r = new Readable();
+  r.push(buf);
+  r.push(null);
+  return r;
+}
+
+function streamToFile(stream, filepath) {
+  return new Promise((resolve, reject) => {
+    const ws = fs.createWriteStream(filepath);
+    stream.on('error', reject);
+    ws.on('error', reject);
+    ws.on('finish', resolve);
+    stream.pipe(ws);
+  });
+}
+
+function safeUnlink(p) {
+  try { fs.unlinkSync(p); } catch {}
+}
